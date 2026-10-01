@@ -6,7 +6,7 @@ Fetches a YouTube Music playlist by URL, fuzzy-matches songs against
 local .mp3 files, renames them to "Title - Artist.mp3", and creates
 an M3U playlist for Phonograph.
 
-Dependencies: ytmusicapi (auto-installed if missing)
+Dependencies: ytmusicapi, mutagen (auto-installed if missing)
 Standard lib only: os, sys, re, argparse, difflib, pathlib
 """
 
@@ -26,6 +26,13 @@ except ImportError:
     print("[*] ytmusicapi not found. Installing...")
     os.system(f"{sys.executable} -m pip install ytmusicapi")
     from ytmusicapi import YTMusic
+
+try:
+    from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TDRC
+except ImportError:
+    print("[*] mutagen not found. Installing...")
+    os.system(f"{sys.executable} -m pip install mutagen")
+    from mutagen.id3 import ID3, ID3NoHeaderError, TIT2, TPE1, TALB, TDRC
 
 
 # ===================== CONFIGURATION DEFAULTS ==============================
@@ -55,7 +62,7 @@ def extract_playlist_id(url_or_id: str) -> str:
 
 
 def fetch_playlist(playlist_id: str):
-    """Return (playlist_name, [{'title': ..., 'artist': ...}, ...])."""
+    """Return (playlist_name, [{'title', 'artist', 'album', 'year'}, ...])."""
     yt = YTMusic()
     data = yt.get_playlist(playlist_id, limit=None)
     songs = []
@@ -64,8 +71,16 @@ def fetch_playlist(playlist_id: str):
         artists = ", ".join(
             a.get("name", "") for a in track.get("artists", []) if a.get("name")
         )
+        album_info = track.get("album") or {}
+        album = album_info.get("name", "") if isinstance(album_info, dict) else ""
+        year = str(track.get("year", "")).strip()
         if title:
-            songs.append({"title": title, "artist": artists})
+            songs.append({
+                "title": title,
+                "artist": artists,
+                "album": album,
+                "year": year,
+            })
     return data.get("title", "Playlist"), songs
 
 
@@ -143,6 +158,76 @@ def scan_local_music(music_dirs):
                         "name": os.path.splitext(fn)[0],
                     })
     return files
+
+
+# --------------- ID3 metadata tagging -------------------------------------
+
+def tag_file(file_path, song, dry_run=False):
+    """
+    Check ID3 tags on an mp3 file and fill in any missing fields
+    (title, artist, album, year) using data from YouTube Music.
+    """
+    try:
+        tags = ID3(file_path)
+    except ID3NoHeaderError:
+        tags = ID3()
+    except Exception as e:
+        print(f"    Tag read error: {e}")
+        return
+
+    changed = False
+
+    # Title (TIT2)
+    if not tags.get("TIT2") and song.get("title"):
+        tags.add(TIT2(encoding=3, text=[song["title"]]))
+        changed = True
+
+    # Artist (TPE1)
+    if not tags.get("TPE1") and song.get("artist"):
+        tags.add(TPE1(encoding=3, text=[song["artist"]]))
+        changed = True
+
+    # Album (TALB)
+    if not tags.get("TALB") and song.get("album"):
+        tags.add(TALB(encoding=3, text=[song["album"]]))
+        changed = True
+
+    # Year (TDRC)
+    if not tags.get("TDRC") and song.get("year"):
+        tags.add(TDRC(encoding=3, text=[song["year"]]))
+        changed = True
+
+    if not changed:
+        return
+
+    if dry_run:
+        missing = []
+        if not ID3(file_path).get("TIT2") and song.get("title"):
+            missing.append("title")
+        if not ID3(file_path).get("TPE1") and song.get("artist"):
+            missing.append("artist")
+        if not ID3(file_path).get("TALB") and song.get("album"):
+            missing.append("album")
+        if not ID3(file_path).get("TDRC") and song.get("year"):
+            missing.append("year")
+        if missing:
+            print(f"    Would tag: {', '.join(missing)}")
+        return
+
+    try:
+        tags.save(file_path)
+        added = []
+        if tags.get("TIT2"):
+            added.append(f"title={song['title']}")
+        if tags.get("TPE1"):
+            added.append(f"artist={song['artist']}")
+        if tags.get("TALB") and song.get("album"):
+            added.append(f"album={song['album']}")
+        if tags.get("TDRC") and song.get("year"):
+            added.append(f"year={song['year']}")
+        print(f"    Tagged: {', '.join(added)}")
+    except Exception as e:
+        print(f"    Tag write error: {e}")
 
 
 # --------------- renaming -------------------------------------------------
@@ -224,6 +309,8 @@ def main():
     )
     ap.add_argument("--no-rename", action="store_true",
                      help="Do not rename local files")
+    ap.add_argument("--no-tags", action="store_true",
+                     help="Do not update ID3 metadata tags")
     ap.add_argument("--dry-run", action="store_true",
                      help="Preview actions without making changes")
     args = ap.parse_args()
@@ -264,6 +351,10 @@ def main():
                   f"{song['title']} - {song['artist']}")
             print(f"       File: {match['filename']}")
             used.add(match["path"])
+
+            # Fill missing ID3 tags before renaming
+            if not args.no_tags:
+                tag_file(match["path"], song, dry_run=args.dry_run)
 
             if args.no_rename:
                 final_path = match["path"]
